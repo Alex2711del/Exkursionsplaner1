@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>Exkursionsplaner Komplett</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body {
+      margin: 0;
+      display: flex;
+      height: 100vh;
+      font-family: Arial, sans-serif;
+    }
+    #sidebar {
+      width: 350px;
+      padding: 20px;
+      background: #f9f9f9;
+      overflow-y: auto;
+      box-shadow: 2px 0 5px rgba(0,0,0,0.1);
+    }
+    #map {
+      flex: 1;
+    }
+    .location {
+      margin-bottom: 10px;
+      background: #fff;
+      padding: 10px;
+      border: 1px solid #ccc;
+      position: relative;
+    }
+    .location input, .location textarea {
+      width: 100%;
+      padding: 5px;
+      margin-top: 5px;
+      margin-bottom: 5px;
+      box-sizing: border-box;
+    }
+    .delete-btn {
+      position: absolute;
+      top: 5px;
+      right: 8px;
+      background: #ff4d4d;
+      color: white;
+      border: none;
+      border-radius: 50%;
+      width: 20px;
+      height: 20px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    input[type="text"], input[type="file"] {
+      margin-top: 10px;
+    }
+    button {
+      width: 100%;
+      padding: 10px;
+      margin-top: 10px;
+      background-color: #007BFF;
+      color: white;
+      border: none;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    .duration-box {
+      margin-top: 20px;
+      font-size: 14px;
+      background: #e0f7fa;
+      padding: 10px;
+      border-left: 4px solid #007BFF;
+    }
+    .error {
+      color: red;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+<div id="sidebar">
+  <h2>Exkursionsplaner</h2>
+  <div id="locations"></div>
+  <input type="text" id="cityInput" placeholder="Ort eingeben (z. B. Graz)" />
+  <input type="time" id="timeInput" value="08:00" />
+  <input type="file" id="imageInput" accept="image/*" />
+  <textarea id="noteInput" rows="2" placeholder="Notizen zum Ort"></textarea>
+  <button onclick="addLocation()">Ort hinzufügen</button>
+  <button onclick="savePlan()">Plan speichern</button>
+  <button onclick="loadPlan()">Plan laden</button>
+  <button onclick="exportPDF()">Als PDF exportieren</button>
+  <div id="error" class="error"></div>
+  <div id="durations" class="duration-box"></div>
+</div>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+  const ORS_API_KEY = "5b3ce3597851110001cf6248113595b105ce4c5a958387e74320539f";
+  const map = L.map('map').setView([47.26, 11.39], 7);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap-Mitwirkende'
+  }).addTo(map);
+  let markers = [];
+  let routeLine = null;
+  let locations = [];
+  Sortable.create(document.getElementById('locations'), {
+    animation: 150,
+    onEnd: updateRoute
+  });
+
+  async function addLocation() {
+    const city = document.getElementById('cityInput').value.trim();
+    const time = document.getElementById('timeInput').value;
+    const note = document.getElementById('noteInput').value;
+    const imageFile = document.getElementById('imageInput').files[0];
+    const errorDiv = document.getElementById('error');
+    errorDiv.textContent = "";
+    if (!city) return;
+    const res = await fetch(`https://api.openrouteservice.org/geocode/search?api_key=${ORS_API_KEY}&text=${encodeURIComponent(city)}&size=1`);
+    const data = await res.json();
+    if (data.features.length === 0) {
+      errorDiv.textContent = "Ort nicht gefunden.";
+      return;
+    }
+    const [lng, lat] = data.features[0].geometry.coordinates;
+    const imageUrl = imageFile ? URL.createObjectURL(imageFile) : null;
+    const locationObj = { city, time, note, imageUrl, coords: [lng, lat] };
+    locations.push(locationObj);
+    renderLocations();
+    updateRoute();
+    document.getElementById('cityInput').value = '';
+    document.getElementById('noteInput').value = '';
+    document.getElementById('imageInput').value = '';
+  }
+
+  function renderLocations() {
+    const locDiv = document.getElementById('locations');
+    locDiv.innerHTML = '';
+    locations.forEach((loc, i) => {
+      const div = document.createElement('div');
+      div.className = 'location';
+      div.setAttribute('data-index', i);
+      div.innerHTML = `
+        <button class="delete-btn" onclick="deleteLocation(${i})">×</button>
+        <strong>${loc.city}</strong><br>Zeit: ${loc.time}<br>
+        ${loc.note ? `<em>Notiz:</em> ${loc.note}<br>` : ''}
+        ${loc.imageUrl ? `<img src="${loc.imageUrl}" alt="Bild" style="width:100%; max-height:100px; object-fit:cover;"><br>` : ''}
+      `;
+      locDiv.appendChild(div);
+    });
+  }
+
+  function deleteLocation(index) {
+    locations.splice(index, 1);
+    renderLocations();
+    updateRoute();
+  }
+
+  async function updateRoute() {
+    markers.forEach(m => map.removeLayer(m));
+    markers = [];
+    if (routeLine) map.removeLayer(routeLine);
+    document.getElementById('durations').innerHTML = '';
+    if (locations.length < 1) return;
+    const coords = locations.map(loc => loc.coords);
+    coords.forEach(([lng, lat], i) => {
+      const m = L.marker([lat, lng]).addTo(map).bindPopup(`${locations[i].city}<br>${locations[i].time}`);
+      markers.push(m);
+    });
+    if (coords.length < 2) return;
+    const response = await fetch("https://api.openrouteservice.org/v2/directions/driving-car/geojson", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": ORS_API_KEY
+      },
+      body: JSON.stringify({ coordinates: coords })
+    });
+    const data = await response.json();
+    routeLine = L.geoJSON(data, { style: { color: 'blue', weight: 5 } }).addTo(map);
+    map.fitBounds(routeLine.getBounds());
+    const segments = data.features[0].properties.segments;
+    let totalMin = 0, totalKm = 0;
+    let info = "<strong>Streckenübersicht:</strong><br>";
+    segments.forEach((seg, i) => {
+      const min = Math.round(seg.duration / 60);
+      const km = (seg.distance / 1000).toFixed(1);
+      totalMin += min;
+      totalKm += parseFloat(km);
+      info += `• ${locations[i].city} → ${locations[i+1].city}: ${min} Min, ${km} km<br>`;
+    });
+    info += `<br><strong>Gesamtdauer:</strong> ${totalMin} Min<br>`;
+    info += `<strong>Gesamtdistanz:</strong> ${totalKm.toFixed(1)} km`;
+    document.getElementById('durations').innerHTML = info;
+  }
+
+  function savePlan() {
+    const data = JSON.stringify(locations);
+    const blob = new Blob([data], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "exkursionsplan.json";
+    a.click();
+  }
+
+  function loadPlan() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json";
+    input.onchange = e => {
+      const file = e.target.files[0];
+      const reader = new FileReader();
+      reader.onload = () => {
+        locations = JSON.parse(reader.result);
+        renderLocations();
+        updateRoute();
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  }
+
+  async function exportPDF() {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
+    doc.setFontSize(14);
+    doc.text("Exkursionsplan", 10, 10);
+    let y = 20;
+    locations.forEach((loc, i) => {
+      doc.text(`${i+1}. ${loc.city} (${loc.time})`, 10, y);
+      y += 6;
+      if (loc.note) {
+        doc.text(`Notiz: ${loc.note}`, 12, y);
+        y += 6;
+      }
+    });
+    doc.save("exkursionsplan.pdf");
+  }
+</script>
+</body>
+</html>
